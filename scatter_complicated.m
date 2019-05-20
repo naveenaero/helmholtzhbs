@@ -12,59 +12,41 @@ clc;
 addpath('~/Box Sync/research/code/export_fig/');
 
 grid.name = 'contour and disc geometry structure';
-tree.name = 'tree structure for storing ';
+tree.name = 'tree structure for storing all matrices';
+% set global parameters
 param = LOCAL_get_parameters();
+% get the scatterer geometry
 grid = LOCAL_get_scatterer_geometry(grid,param);
-% LOCAL_plot_geometry(grid, param, false);
+% plot geometry
+LOCAL_plot_geometry(grid, param, false);
+% recursively divide the contour indices
 tree = LOCAL_generate_index_tree(tree,param);
+% for each neighbour generate a list of neighbours which might have points
+% inside a given contour (done for each level)
 tree = LOCAL_generate_neighbour_list(tree,grid,param);
 tic;
+% Compute the leaf interaction, sibling interaction and short basis
+% matrices for all nodes in the tree.
 tree = LOCAL_compress_all_levels(tree,grid,param);
+compress_time = toc;
+tic;
+% bottom up construction of the scattering matrices
 tree = LOCAL_generate_scattering_matrices(tree);
-fprintf('Time to compute scattering matrix for complicated geometery = %0.4f\n', toc);
-tree = LOCAL_invert_HBS_matrix(tree);
+scatter_time = toc;
+fprintf('Compress time = %0.4f, scatter time = %0.4f\n', compress_time, scatter_time);
+% tree = LOCAL_invert_HBS_matrix(tree);
 return
 
 
-function tree = LOCAL_invert_HBS_matrix(tree)
-    for nid=tree.nnodes:-1:2
-        if tree.node{nid}.isleaf
-            X = tree.node{nid}.A;
-        else
-            lid = 2*nid;
-            rid = 2*nid+1;
-            At_lr = tree.node{nid}.At_lr;
-            At_rl = tree.node{nid}.At_rl;            
-            X1 = tree.node{lid}.D;
-            X2 = tree.node{rid}.D;
-            X = [X1, At_lr; At_rl, X2];
-        end
-        
-        Xinv = inv(X);
-        T = tree.node{nid}.T;
-        k = tree.node{nid}.k;
-        Ustar = [eye(k), T];
-        D = inv(Ustar*Xinv*Ustar');
-        Xinv_U = Xinv*Ustar';
-        Ustar_Xinv = Ustar*Xinv;
-        E = Xinv_U*D;
-        Fstar = D*Ustar_Xinv;
-        tree.node{nid}.G = X - E*Ustar_Xinv;
-        tree.node{nid}.E = E;
-        tree.node{nid}.Fstar = Fstar;
-        tree.node{nid}.D = D;
-    end
-    
-    G = [tree.node{2}.D, tree.node{1}.At_lr; tree.node{1}.At_rl, tree.node{3}.D];
-    tree.node{1}.G = inv(G);
-return
-
-function tree = LOCAL_compress_all_levels(tree,grid,param)
+function tree = LOCAL_compress_all_levels(tree,grid,param)   
+    tree.avgk = zeros(tree.nlevels,1);
+    % loop over all nodes in the tree
     for nid=tree.nnodes:-1:1
         if tree.node{nid}.isleaf
             indskel = tree.node{nid}.itau;
         else
-            % concatenate indskels of left and right children
+            % concatenate indskels of left and right children index
+            % skeletons
             lid = tree.node{nid}.left_child;
             rid = tree.node{nid}.right_child;
             indskel = [tree.node{lid}.Ik, tree.node{rid}.Ik];
@@ -73,9 +55,7 @@ function tree = LOCAL_compress_all_levels(tree,grid,param)
         % get the geometry at current node
         C = grid.C(:, sort(indskel));
         % get the circumcircle
-        [xc,yc,R,~] = LOCAL_get_circumcircle(C);
-        % get proxy circle
-        Cproxy = LOCAL_get_proxy_circle(xc, yc, param.proxyscale*R, grid, param);
+        [xc,yc,R,~] = LOCAL_get_circumcircle(C);       
         % loop over the neighbour list to find points inside the proxy
         % circle
         inside = [];        
@@ -92,26 +72,41 @@ function tree = LOCAL_compress_all_levels(tree,grid,param)
         % find which indices are inside the proxy circle
         inside = inside( (grid.C(1,inside) - xc).^2  + (grid.C(4,inside)-yc).^2 < (param.proxyscale*R)^2);
         
-%         
-        Aout = [LOCAL_get_A_single_offd(grid.C,  inside,  indskel, param);...
-                    LOCAL_get_A_sing(Cproxy, 1:param.M, grid.C, indskel, param)];
-        Ain = [LOCAL_get_A_single_offd(grid.C,  indskel, inside, param),...
-                    LOCAL_get_A_sing(grid.C, indskel, Cproxy, 1:param.M, param)];
-
+%         tot_inside = length(indskel);
+        % select number of points on the proxy based on total points inside
+%         param.M = ceil(tot_inside/4);
+        Cproxy = LOCAL_get_proxy_circle(xc, yc, param.proxyscale*R, grid, param);
+        
 %         Aout = [LOCAL_get_A_single_offd(grid.C,  inside,  indskel, param);...
-%                     LOCAL_outgoing_to_proxy(Cproxy, 1:param.M, grid.C, indskel, param)];
+%                     LOCAL_get_A_sing(Cproxy, 1:param.M, grid.C, indskel, param)];
 %         Ain = [LOCAL_get_A_single_offd(grid.C,  indskel, inside, param),...
-%                     LOCAL_incoming_from_proxy(grid.C, indskel, Cproxy, 1:param.M, param)];
-%                                     
+%                     LOCAL_get_A_sing(grid.C, indskel, Cproxy, 1:param.M, param)];
+        
+        % compute near interations and incoming and outgoing field short
+        % representations
+        Aout = [LOCAL_get_A_single_offd(grid.C,  inside,  indskel, param);...
+                    LOCAL_outgoing_to_proxy(Cproxy, 1:param.M, grid.C, indskel, param)];
+        Ain = [LOCAL_get_A_single_offd(grid.C,  indskel, inside, param),...
+                    LOCAL_incoming_from_proxy(grid.C, indskel, Cproxy, 1:param.M, param)];
+        
+%         if nid==1
+%             figure;
+%             semilogy(svd([Aout;Ain']));
+%         end
         % Compute the skeletons.
        [T,I] = id_decomp([Aout;Ain'], param.acc);
        % get rank
        k  = size(T,1);
+       fprintf('nid=%d, k=%d, ninside=%d\n', nid, k, length([indskel, inside]));
        
+       % store matrices
        tree.node{nid}.k = k;
        tree.node{nid}.T = T;
        tree.node{nid}.Ik = indskel(I(1:k));
-       tree.node{nid}.I = I;       
+       tree.node{nid}.I = I;
+       level = tree.node{nid}.level;
+       % compute average rank on given level 
+       tree.avgk(level+1) = tree.avgk(level+1) + k/2^level;
     end
     
     
@@ -262,11 +257,11 @@ return
 
 function param = LOCAL_get_parameters()
     % number of stars in each direction
-    param.ngx = 2;
-    param.ngy = 2;
+    param.ngx = 4;
+    param.ngy = 4;
     param.ng = param.ngx * param.ngy;
     % number of grid points in a star
-    param.N = 200;
+    param.N = 200;    
     param.h = 2*pi/param.N;
     % number of points on the circular proxy surface
     param.M = 50;
@@ -275,11 +270,16 @@ function param = LOCAL_get_parameters()
     param.spy = 3;
     % wave number in helmholtz operator
     param.kh = 2;
-    % rank of off-diagonal blocks
-    param.k = param.N/2;
+    % rank of off-diagonal blocks (if fixed k is used)
+    param.k = 100;
+    % tolerance
     param.acc = 1e-10;
     % proxy circle scale
     param.proxyscale = 1.5;
+    % star geometry parameters pg(1) = inversely proportional to curvature 
+    % pg(2) = number of petals in the star
+    param.pg(1) = 0.4;
+    param.pg(2) = 10;
 return
 
 function grid = LOCAL_get_scatterer_geometry(grid,param)
@@ -302,7 +302,7 @@ function grid = LOCAL_get_scatterer_geometry(grid,param)
     for i=1:ngx
         for j=1:ngy
             k = (j-1 + (i-1)*ngy);            
-            grid.C(:, N*k+1:N*(k+1)) = LOCAL_get_geometry_star(N, [grid.xc(k+1); grid.yc(k+1)]);            
+            grid.C(:, N*k+1:N*(k+1)) = LOCAL_get_geometry_star(N, [grid.xc(k+1); grid.yc(k+1)], param.pg);            
         end
     end
     grid.diameter = 2*max(sqrt(grid.C(1,1:N).^2 + grid.C(4,1:N).^2));  % The diameter of the contour.
@@ -333,26 +333,9 @@ function LOCAL_plot_geometry(grid,param,save)
     axis equal;
     set(gca,'XColor','none'); set(gca,'YColor','none')
     if save
-        export_fig('figures/geometry1.pdf', '-q101', '-pdf', '-transparent');
+        export_fig('figures/geometry_tight.pdf', '-q101', '-pdf', '-transparent');
     end
 return
-
-function A = LOCAL_get_A_sing(C1,ind1,C2,ind2,param)
-    kh = param.kh;
-    h  = param.h;
-
-    [Y_g1,  X_g1  ] = meshgrid(C2(1,ind2), C1(1,ind1));
-    [Y_g2,  X_g2  ] = meshgrid(C2(4,ind2), C1(4,ind1));
-    [Y_dg1, ~] = meshgrid(C2(2,ind2), C1(2,ind1));
-    [Y_dg2, ~] = meshgrid(C2(5,ind2), C1(5,ind1));    
-    ima = sqrt(-1);
-    nn1 = ( Y_dg2./sqrt(Y_dg1.*Y_dg1 + Y_dg2.*Y_dg2));
-    nn2 = (-Y_dg1./sqrt(Y_dg1.*Y_dg1 + Y_dg2.*Y_dg2));
-    dd  = sqrt((Y_g1 - X_g1).^2 + (Y_g2 - X_g2).^2);
-    A   = ((nn1.*(Y_g1 - X_g1) + nn2.*(Y_g2 - X_g2)).*(1./dd).*(-kh*besselh(1, kh*dd)) + ...
-          ima*kh*besselh(0, kh*dd)).*h.*sqrt(Y_dg1.^2 + Y_dg2.^2);    
-return
-       
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % This function computes diagonal blocks of the coefficient matrix.
@@ -435,10 +418,10 @@ return
 %   C(6,i) = second derivative of x2 coordinate of node i
 %
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-function [C,curvelen,xx_int,xx_ext] = LOCAL_get_geometry_star(ntot,xxc)
+function [C,curvelen,xx_int,xx_ext] = LOCAL_get_geometry_star(ntot,xxc,pg)
 
-r        = 0.3;
-k        = 5;
+r        = pg(1);
+k        = pg(2);
 tt       = linspace(0,2*pi*(1 - 1/ntot),ntot);
 C        = zeros(6,ntot );
 C(1,:)   =   1.5*cos(tt) + (r/2)*            cos((k+1)*tt) + (r/2)*            cos((k-1)*tt);
